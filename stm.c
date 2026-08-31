@@ -1,56 +1,16 @@
-/* USER CODE BEGIN Header */
-/**
- ******************************************************************************
- * @file           : main.c
- * @brief          : Main program body
- ******************************************************************************
- * @attention
- *
- * Copyright (c) 2026 STMicroelectronics.
- * All rights reserved.
- *
- * This software is licensed under terms that can be found in the LICENSE file
- * in the root directory of this software component.
- * If no LICENSE file comes with this software, it is provided AS-IS.
- *
- ******************************************************************************
- */
-/* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include <stdio.h>
 #include <string.h>
-/* Private includes ----------------------------------------------------------*/
-/* USER CODE BEGIN Includes */
-
-/* USER CODE END Includes */
-
-/* Private typedef -----------------------------------------------------------*/
-/* USER CODE BEGIN PTD */
-
-/* USER CODE END PTD */
-
-/* Private define ------------------------------------------------------------*/
-/* USER CODE BEGIN PD */
-
-/* USER CODE END PD */
-
-/* Private macro -------------------------------------------------------------*/
-/* USER CODE BEGIN PM */
-
-/* USER CODE END PM */
+#include <stdio.h>
 
 /* Private variables ---------------------------------------------------------*/
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
+TIM_HandleTypeDef htim4;
 
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
-
-/* USER CODE BEGIN PV */
-
-/* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
@@ -60,97 +20,434 @@ static void MX_TIM1_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_TIM3_Init(void);
-/* USER CODE BEGIN PFP */
+static void MX_TIM4_Init(void);
 
-/* USER CODE END PFP */
-
-/* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
 void delay_us(uint16_t us);
 
-int _write(int file, char *ptr, int len) {
+int _write(int file, char *ptr, int len)
+{
    HAL_UART_Transmit(&huart2, (uint8_t*)ptr, len, 100);
    return len;
 }
 
-void wheel_on(int LT, int LB, int RB, int RT, int speed);
-void wheel_stop(int off_wheel);
-// ------------------------------------------------------통신------------------------------------------------------------
+/* ================================================================
+ * ★★★ 핵심 설계 변경: 연속 주행 -> 펄스(버스트) 주행 ★★★
+ *
+ * [기존 문제]
+ * 라즈베리파이는 YOLO 추론이 끝날 때마다(수백 ms 간격) 명령을 보내는데,
+ * 기존 코드는 명령을 받으면 "다음 명령이 올 때까지" 그 동작을 계속했다.
+ * 즉 추론 1프레임 사이(예: 250ms) 내내 로봇이 눈을 감은 채 회전/전진했고,
+ * 그래서 목표를 지나쳐버리는 오버슈트가 발생했다.
+ * pwm을 더 낮출 수 없으므로, "속도"가 아니라 "움직이는 시간"을 줄여야 한다.
+ *
+ * [새 방식]
+ * 추적 명령(A/D/F) 1개 = 아주 짧은 펄스 1회.
+ *   -> PULSE_*_MS 만큼만 모터를 돌리고 자동으로 정지한다.
+ *   -> 다음 명령이 올 때까지 로봇은 멈춰서 대기한다.
+ *   -> 결과적으로 "라파5가 한 프레임 볼 때마다 로봇이 한 걸음씩" 움직인다.
+ *      추론이 느려지면 로봇도 자동으로 느려지므로 항상 동기화된다.
+ *
+ * [워치독]
+ * 추적 모드에서 CMD_WATCHDOG_MS 동안 명령이 한 번도 안 오면
+ * (라파5 다운, 시리얼 끊김, 네트워크 지연 등) 무조건 정지시킨다.
+ * 로봇이 통제 불능으로 계속 달리는 상황을 원천 차단하는 안전장치.
+ *
+ * [튜닝 가이드]
+ * - 여전히 오버슈트(목표를 지나침) -> PULSE_*_MS 를 줄인다.
+ * - 너무 찔끔거려서 답답함        -> PULSE_*_MS 를 늘린다.
+ * - 로봇이 자꾸 멈춰있다          -> CMD_WATCHDOG_MS 를 늘린다
+ *                                   (라파5 추론이 그만큼 느리다는 뜻)
+ * ================================================================ */
+/* ================================================================
+ * ★ 회전 펄스 2단계
+ *
+ * 펄스가 너무 짧으면 한 번에 몇 도씩만 돌아서, 로봇이 목표를
+ * 향해 "지글거리며" 떠는 것처럼 보인다. 그렇다고 무조건 키우면
+ * 이번엔 목표를 지나쳐버린다(오버슈트).
+ * 그래서 화면상 좌우 오차 크기에 따라 두 단계로 나눈다:
+ *   - 많이 틀어져 있음 -> BIG 펄스로 시원하게 돌린다
+ *   - 거의 맞았음      -> FINE 펄스로 살살 맞춘다
+ * 파이썬이 오차를 보고 L/R(큰 회전) 또는 A/D(미세 회전)를 보낸다.
+ *
+ * [튜닝]
+ *  아직도 찔끔거려 보이면 -> PULSE_TURN_BIG_MS 를 늘린다
+ *  큰 회전에서 지나치면   -> PULSE_TURN_BIG_MS 를 줄인다
+ *  중앙 근처에서 떨면     -> PULSE_TURN_FINE_MS 를 줄인다
+ * ================================================================ */
+#define PULSE_TURN_BIG_MS     240    /* 큰 회전 (오차가 클 때) */
+#define PULSE_TURN_FINE_MS     90    /* 미세 회전 (거의 정렬됐을 때) */
+#define PULSE_FWD_MS          140    /* 전진 1회 펄스 길이(ms) */
+#define PULSE_BACK_MS         160    /* 후진 1회 펄스 길이(ms)
+                                      * 물체가 화면 너무 아래(= 로봇에 너무 근접)로
+                                      * 내려와서 카메라 사각지대에 들어가기 직전일 때,
+                                      * 뒤로 살짝 빼서 물체를 다시 화면 위쪽으로
+                                      * 올려놓기 위한 펄스. 전진보다 살짝 길게 잡아야
+                                      * 정지 마찰을 이기고 실제로 후진이 된다. */
+#define CMD_WATCHDOG_MS       700    /* 이 시간 동안 추적 명령 없으면 강제 정지 */
+
+/* 초음파/디버그 출력 주기 (매 루프마다 하면 루프가 느려져서 펄스 타이밍이 밀림) */
+#define ULTRASONIC_INTERVAL_MS 200
+#define ECHO_TIMEOUT_MS         30   /* 에코 대기 최대 시간. 초과 시 측정 실패 처리 */
+#define PRINT_INTERVAL_MS      500
+
+#define CMD_SETTLE_MS           60   /* 수동 명령 전환 시 짧은 안정화 */
+
+/* ================================================================
+ * ★★★ 팔(문) 동작 - 양쪽 동시 닫힘 (원통형 대응) ★★★
+ *
+ * [왜 동시에 닫는가]
+ * 캔/페트병은 원통이고 팔은 각진 평면이다. 한쪽 팔만 밀어서
+ * 반대쪽 '벽'에 붙이는 방식(sweep)은 미는 힘의 작용선이 물체
+ * 무게중심을 정확히 지나지 않는 순간 회전 토크가 생기고,
+ * 원통은 그 토크로 굴러서 팔 밖으로 빠져나간다.
+ *
+ * 양쪽을 동시에 같은 속도로 닫으면 두 접촉면의 힘이 서로
+ * 상쇄되어 회전 토크가 생기지 않는다. 선반 척(chuck)이 원통을
+ * 물듯이, 닫히는 축 방향으로 물체가 스스로 중앙에 정렬된다.
+ *
+ * [여전히 천천히 닫는 이유]
+ * 목표 펄스폭을 한 번에 써버리면 서보가 전속력으로 휘둘러져서
+ * '쓸어담기'가 아니라 '쳐내기'가 된다. 여러 단계로 나눠서
+ * 조금씩 이동시켜야 물체를 밀어 넣는 동작이 된다.
+ *
+ * ★ 남은 한계: 이 방식도 닫히는 축(앞뒤)만 구속한다.
+ *   좌우는 여전히 열려 있으므로, 물체가 옆으로 굴러 빠지는 건
+ *   측벽 같은 하드웨어 없이는 완전히 막을 수 없다.
+ *
+ * ARM_A_CH / ARM_B_CH 는 앞/뒤 팔 두 개. 동시에 움직이므로
+ * 어느 쪽이 어느 채널인지는 동작에 영향을 주지 않는다.
+ * ================================================================ */
+#define ARM_A_CH           TIM_CHANNEL_3   /* 팔 1 */
+#define ARM_B_CH           TIM_CHANNEL_2   /* 팔 2 */
+
+#define ARM_A_OPEN         1100
+#define ARM_A_CLOSE        2500
+#define ARM_B_OPEN         2400
+#define ARM_B_CLOSE        1100
+
+/* 닫을 때 몇 단계로 나눠 움직일지 / 각 단계 사이 지연(ms)
+ *
+ * ★ 총 닫힘 시간 = ARM_CLOSE_STEPS * ARM_CLOSE_STEP_MS
+ *   현재: 30 * 25 = 750ms. 양쪽이 동시에 움직이므로 이게 곧
+ *   전체 닫힘 시간이다 (순차 방식일 때의 약 1.7초에서 단축됨).
+ *
+ * 팔이 너무 빨리 닫혀서 쓰레기를 쳐내면 두 값을 더 키운다.
+ * 반대로 너무 느려서 답답하면 STEP_MS를 줄인다.
+ * (STEPS를 줄이면 움직임이 뚝뚝 끊겨 보이므로 STEP_MS부터 조절할 것) */
+#define ARM_CLOSE_STEPS      30
+#define ARM_CLOSE_STEP_MS    25
+
+/* 여는 건 빨라도 상관없다 (쓰레기와 접촉하지 않는 방향) */
+#define ARM_OPEN_STEPS        6
+#define ARM_OPEN_STEP_MS     12
+
+/* ================================================================
+ * ★ 's' 긴급 정지(estop)
+ * ISR에서 즉시 PWM 레지스터를 0으로 만들어 물리적으로 모터를 멈추고,
+ * estop_request 플래그를 세팅한다. 메인 루프 최상단에서 가장 먼저 검사한다.
+ * ================================================================ */
+volatile int estop_request = 0;
+
+static void delay_ms_check_estop(uint32_t ms)
+{
+   uint32_t start = HAL_GetTick();
+   while ((HAL_GetTick() - start) < ms)
+   {
+      if (estop_request) return;
+   }
+}
+
+/* ================================================================
+ * ★ 두 서보를 '동시에' 목표 위치까지 여러 단계로 나눠 이동시킨다.
+ *
+ * 한 루프 안에서 두 채널을 같은 단계 비율로 함께 갱신하는 것이
+ * 핵심이다. 채널을 하나씩 순차로 램프하면 결국 한쪽이 먼저 닫히는
+ * 것과 같아져서, 원통형 물체에 회전 토크가 생긴다.
+ * ================================================================ */
+static void arm_ramp_both(int a_from, int a_to, int b_from, int b_to,
+                          int steps, uint32_t step_ms)
+{
+   if (steps <= 0) steps = 1;
+
+   for (int i = 1; i <= steps; i++)
+   {
+      if (estop_request) return;
+
+      int a_val = a_from + ((a_to - a_from) * i) / steps;
+      int b_val = b_from + ((b_to - b_from) * i) / steps;
+
+      /* 두 채널을 연속으로 써서 사실상 동시에 움직이게 한다 */
+      __HAL_TIM_SET_COMPARE(&htim3, ARM_A_CH, a_val);
+      __HAL_TIM_SET_COMPARE(&htim3, ARM_B_CH, b_val);
+
+      delay_ms_check_estop(step_ms);
+   }
+
+   if (!estop_request)
+   {
+      __HAL_TIM_SET_COMPARE(&htim3, ARM_A_CH, a_to);
+      __HAL_TIM_SET_COMPARE(&htim3, ARM_B_CH, b_to);
+   }
+}
+
+/* 팔 열기: 양쪽 동시에 벌린다.
+ * 여는 방향은 물체와 부딪히지 않으므로 빠르게 해도 된다. */
+static void arm_open(void)
+{
+   arm_ramp_both(ARM_A_CLOSE, ARM_A_OPEN,
+                 ARM_B_CLOSE, ARM_B_OPEN,
+                 ARM_OPEN_STEPS, ARM_OPEN_STEP_MS);
+}
+
+/* ★ 팔 닫기: 양쪽을 동시에, 천천히 오므린다.
+ * 두 접촉면의 힘이 상쇄되어 원통형 물체가 회전하지 않고
+ * 닫히는 축 방향으로 스스로 중앙에 정렬된다. */
+static void arm_close_sweep(void)
+{
+   arm_ramp_both(ARM_A_OPEN, ARM_A_CLOSE,
+                 ARM_B_OPEN, ARM_B_CLOSE,
+                 ARM_CLOSE_STEPS, ARM_CLOSE_STEP_MS);
+}
+
+/* 즉시 닫기 (정지/초기화용. 물체를 담는 동작이 아니므로 램프 불필요) */
+static void arm_close_fast(void)
+{
+   __HAL_TIM_SET_COMPARE(&htim3, ARM_A_CH, ARM_A_CLOSE);
+   __HAL_TIM_SET_COMPARE(&htim3, ARM_B_CH, ARM_B_CLOSE);
+}
+
+static void wheel_drive(int left_dir, int left_speed, int right_dir, int right_speed)
+{
+   if (left_speed  < 0)   left_speed  = 0;
+   if (left_speed  > 999) left_speed  = 999;
+   if (right_speed < 0)   right_speed = 0;
+   if (right_speed > 999) right_speed = 999;
+
+   if (left_dir) {
+      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_4, 0);
+      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, left_speed);
+   } else {
+      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, 0);
+      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_4, left_speed);
+   }
+
+   if (right_dir) {
+      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, 0);
+      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, right_speed);
+   } else {
+      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
+      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, right_speed);
+   }
+}
+
+void wheel_stop_all(void)
+{
+   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
+   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, 0);
+   __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_4, 0);
+   __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, 0);
+}
+
+/* 램프(가속) 주행 - 수동/자율주행 등 "계속 달리는" 동작에만 사용.
+ * 추적 펄스에는 쓰지 않는다 (램프에만 240ms 넘게 걸려서 펄스가 성립 안 됨). */
+void wheel_on(int left_dir, int right_dir, int speed)
+{
+   if (speed <= 0) speed = 900;
+
+   int step = speed / 4;
+   if (step <= 0) step = speed;
+
+   for (int s = 0; s <= speed; s += step) {
+      if (estop_request) { wheel_stop_all(); return; }
+      wheel_drive(left_dir, s, right_dir, s);
+      delay_ms_check_estop(60);
+   }
+
+   if (estop_request) { wheel_stop_all(); return; }
+   wheel_drive(left_dir, speed, right_dir, speed);
+}
+
+void wheel_decel_stop(int forward)
+{
+   for (int s = 900; s >= 0; s -= 225) {
+      if (estop_request) break;
+
+      if (forward) {
+         __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, s);
+         __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, s);
+      } else {
+         __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, s);
+         __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_4, s);
+      }
+      delay_ms_check_estop(60);
+   }
+   wheel_stop_all();
+}
+
+/* ================================================================
+ * 초음파 측정 (타임아웃 포함)
+ *
+ * ★ 기존 코드의 while(ReadPin(...)) 무한 대기는 센서가 응답하지 않으면
+ *   메인 루프가 영원히 갇힌다. 그러면 estop 플래그가 세팅돼도 루프가
+ *   그걸 검사하러 오지 못해서 로봇이 완전히 먹통이 된다.
+ *   여기서는 ECHO_TIMEOUT_MS 초과 시 -1을 리턴하고 빠져나온다.
+ * 리턴 0 = 성공, -1 = 측정 실패(센서 이상/타임아웃/정지요청)
+ * ================================================================ */
+static int us_measure(GPIO_TypeDef *trig_port, uint16_t trig_pin,
+                      GPIO_TypeDef *echo_port, uint16_t echo_pin,
+                      float *out_cm)
+{
+   uint32_t t0;
+
+   HAL_GPIO_WritePin(trig_port, trig_pin, GPIO_PIN_SET);
+   delay_us(10);
+   HAL_GPIO_WritePin(trig_port, trig_pin, GPIO_PIN_RESET);
+
+   t0 = HAL_GetTick();
+   while (HAL_GPIO_ReadPin(echo_port, echo_pin) == GPIO_PIN_RESET) {
+      if ((HAL_GetTick() - t0) > ECHO_TIMEOUT_MS) return -1;
+      if (estop_request) return -1;
+   }
+
+   __HAL_TIM_SET_COUNTER(&htim4, 0);
+
+   t0 = HAL_GetTick();
+   while (HAL_GPIO_ReadPin(echo_port, echo_pin) == GPIO_PIN_SET) {
+      if ((HAL_GetTick() - t0) > ECHO_TIMEOUT_MS) return -1;
+      if (estop_request) return -1;
+   }
+
+   *out_cm = __HAL_TIM_GET_COUNTER(&htim4) * 0.034f / 2.0f;
+   return 0;
+}
+
+/* ================================================================
+ * 상태 변수
+ * ★ ISR과 메인 루프가 함께 쓰는 변수는 전부 volatile.
+ *   기존 코드는 estop/eat 관련만 volatile이고 move, front_door 등이
+ *   빠져 있었다. 최적화가 걸리면 메인 루프가 이 값을 레지스터에
+ *   캐싱해서 UART로 보낸 명령이 반영 안 되는 간헐적 버그가 생긴다.
+ * ================================================================ */
 uint8_t rxData;
-int turn_left = 2;
-int turn_back_left = 0;
-int move = 0;
-int input_state = 0;
+
+volatile int turn_left        = 1;
+volatile int turn_back_left   = 0;
+volatile int move             = 0;
+volatile int input_state      = 0;
+volatile int front_door       = 0;
+volatile int last_front_door_state = 0;
+volatile char last_rx_char    = 0;
+volatile uint8_t rx_print_flag = 0;
+
+/* 추적(펄스) 관련 */
+volatile int      pulse_request   = 0;  /* 0=없음 1=좌 2=우 3=전진 (ISR이 세팅) */
+volatile int      tracking_mode   = 0;  /* 추적 명령을 받고 있는 중인가 */
+volatile uint32_t last_track_tick = 0;  /* 마지막 추적 명령 수신 시각 */
+
+static int      pulse_active   = 0;     /* 펄스 주행 중인가 */
+static uint32_t pulse_end_tick = 0;     /* 이 시각이 되면 정지 */
+
+/* eat 시퀀스 */
+volatile int eat_request = 0;
+volatile int arm_busy    = 0;
+
+/* ================================================================
+ * ★ EAT 시퀀스 타이밍 (반드시 실측)
+ *
+ * OPEN_HOLD_MS : 문을 연 채로 제자리 정지하는 시간.
+ *   라파5가 이미 접근을 끝내고 'e'를 보낸 것이므로 길 이유가 없다.
+ *   길면 그동안 아무것도 안 하고 서 있는 낭비 시간이 된다.
+ *
+ * EAT_TRAVEL_MS : 문이 열린 채로 실제 스쿱 전진하는 시간.
+ *   -> 물체를 트리거 지점에 놓고 'e' 수신 순간부터 물체가 입 안에
+ *      완전히 들어올 때까지 스톱워치로 재서 넣을 것.
+ *   -> 파이썬 FINAL_APPROACH_TIME 과 이 값의 "합"이 실제 거리와
+ *      맞아야 한다. 한쪽만 맞추면 안 됨.
+ * ================================================================ */
+#define OPEN_HOLD_MS    400   /* 팔을 다 연 뒤 전진 시작까지 대기.
+                               * 서보가 완전히 열리기 전에 출발하면
+                               * 반쯤 열린 팔에 쓰레기가 걸린다. */
+
+#define EAT_TRAVEL_MS  2000   /* ★ 팔을 연 채로 전진하는 시간.
+                               * 이 값이 "팔 벌리고 얼마나 더 들어가느냐"를
+                               * 결정한다. 쓰레기가 팔 사이 깊숙이 안 들어오면
+                               * 이 값을 키운다. 지나쳐서 밀어내면 줄인다.
+                               * 반드시 실측: 'e' 수신 순간부터 쓰레기가 팔
+                               * 정중앙에 들어올 때까지 스톱워치로 잴 것. */
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
-   // 💡 라즈베리 파이 5가 연결된 USART1 통로로 데이터가 들어왔을 때만 실행합니다.
    if (huart->Instance == USART1)
    {
-      // 허큘러스로 수신 확인 출력
-//      char pcMsg[50];
-//      sprintf(pcMsg, "[Nucleo] Received: '%c'\r\n", rxData);
+      last_rx_char = rxData;
+      rx_print_flag = 1;
 
-      if (rxData == '1')// 뒷문 오픈
+      /* ============================================================
+       * ★ 대문자 = 라즈베리파이 YOLO 추적 명령 (펄스 주행)
+       *     L=큰좌회전  R=큰우회전   (오차가 클 때, 시원하게 돌림)
+       *     A=미세좌회전 D=미세우회전 (거의 정렬됐을 때)
+       *     F=전진      B=후진
+       *   소문자 a/d/f/b = 사람이 조작하는 수동 명령 (연속 주행)
+       * 둘을 문자로 분리해서, 추적 명령만 짧은 펄스로 처리한다.
+       * ISR에서는 플래그만 세우고 실제 구동은 메인 루프가 한다.
+       * ============================================================ */
+      if (rxData == 'A' || rxData == 'D' || rxData == 'F' ||
+          rxData == 'B' || rxData == 'L' || rxData == 'R')
       {
-         __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 400);  // 90도
+         if (rxData == 'A')      pulse_request = 1;   /* 미세 좌회전 */
+         else if (rxData == 'D') pulse_request = 2;   /* 미세 우회전 */
+         else if (rxData == 'F') pulse_request = 3;   /* 전진 */
+         else if (rxData == 'B') pulse_request = 4;   /* 후진 (너무 가까울 때) */
+         else if (rxData == 'L') pulse_request = 5;   /* 큰 좌회전 */
+         else                    pulse_request = 6;   /* 큰 우회전 */
+
+         tracking_mode   = 1;
+         last_track_tick = HAL_GetTick();   /* 워치독 먹이주기 */
       }
-      else if (rxData == '0') // 뒷문 닫기
+      else if (rxData == '1')
       {
-         __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 1200); // 0도
+         __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 400);
+      }
+      else if (rxData == '0')
+      {
+         __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 1200);
+      }
+      else if (rxData == 'l') { turn_left = 2; }
+      else if (rxData == 'r') { turn_left = 1; }
+      else if (rxData == 'p') { turn_back_left = 2; }
+      else if (rxData == 'q') { turn_back_left = 1; }
+      else if (rxData == 'f') { move = 1; input_state = 1; tracking_mode = 0; }
+      else if (rxData == 'b') { move = 2; input_state = 1; tracking_mode = 0; }
+      else if (rxData == 'a') { move = 3; input_state = 1; tracking_mode = 0; }
+      else if (rxData == 'd') { move = 4; input_state = 1; tracking_mode = 0; }
+      else if (rxData == 's')
+      {
+         /* ★ 최우선 정지: 메인 루프가 뭘 하고 있든 여기서 즉시 모터를 세운다.
+          * 레지스터 쓰기만 하므로 ISR에서 안전하다. */
+         move = 5;
+         input_state   = 0;
+         estop_request = 1;
+         tracking_mode = 0;
+         pulse_request = 0;
+
+         __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
+         __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, 0);
+         __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_4, 0);
+         __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, 0);
+      }
+      else if (rxData == 'y') { move = 6; input_state = 0; }
+      else if (rxData == 'n') { move = 1; input_state = 1; tracking_mode = 0; }
+      else if (rxData == 'o') { front_door = 1; }
+      else if (rxData == 'c') { front_door = 0; }
+      else if (rxData == 'e')
+      {
+         /* 이미 eat 시퀀스 처리 중이면 요청 자체를 버린다.
+          * (예전엔 pending 됐다가 arm_busy 풀리는 순간 문이 또 열렸음) */
+         if (!arm_busy) eat_request = 1;
       }
 
-      else if (rxData == 'r'){ //오른쪽 돌기
-         turn_left = 2;
-      }
-
-      else if (rxData == 'l'){ //왼쪽 돌기
-         turn_left = 1;
-      }
-
-      else if (rxData == 'p'){ //오른쪽 돌기
-         turn_back_left = 2;
-      }
-
-
-      else if (rxData == 'q'){ //왼쪽 돌기
-         turn_back_left = 1;
-      }
-
-      else if (rxData == 'f'){// 전진
-         move = 1;
-         input_state = 1;
-      }
-
-      else if (rxData == 'b'){//후진
-         move = 2;
-         input_state = 1;
-      }
-
-      else if (rxData == 'a'){//바로 좌회전
-         move = 3;
-         input_state = 1;
-      }
-
-      else if (rxData == 'd'){//바로 우회전
-         move = 4;
-         input_state = 1;
-      }
-
-      else if (rxData == 's'){// 정지
-//         move = 5;
-      }
-
-      else if (rxData == 'o'){// 앞문 열기
-         __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 2000); // 왼
-         __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, 1500); // 오
-      }
-
-      else if (rxData == 'c'){// 앞문 닫기
-         __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 1100);
-         __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, 2400);
-      }
-      // 다음 수신 대기
       HAL_UART_Receive_IT(&huart1, &rxData, 1);
    }
 }
@@ -160,350 +457,415 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
    if (huart->Instance == USART1)
    {
       __HAL_UART_CLEAR_OREFLAG(huart);
-
       HAL_UART_AbortReceive(huart);
-
       HAL_UART_Receive_IT(&huart1, &rxData, 1);
-
-//      printf("UART Error Recovered\r\n");
    }
 }
 
 /* USER CODE END 0 */
 
-/**
- * @brief  The application entry point.
- * @retval int
- */
 int main(void)
 {
-
-   /* USER CODE BEGIN 1 */
-
-   /* USER CODE END 1 */
-
-   /* MCU Configuration--------------------------------------------------------*/
-
-   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
    HAL_Init();
-
-   /* USER CODE BEGIN Init */
-
-   /* USER CODE END Init */
-
-   /* Configure the system clock */
    SystemClock_Config();
 
-   /* USER CODE BEGIN SysInit */
-
-   /* USER CODE END SysInit */
-
-   /* Initialize all configured peripherals */
    MX_GPIO_Init();
    MX_USART2_UART_Init();
    MX_TIM1_Init();
    MX_TIM2_Init();
    MX_USART1_UART_Init();
    MX_TIM3_Init();
-   /* USER CODE BEGIN 2 */
-   //---------------------------------------------통신-------------------------------------------
+   MX_TIM4_Init();
+
    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
-
    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
 
-   // 2. 초기 위치 0도
    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 1200);
    HAL_Delay(500);
 
-   // 3. USART1 인터럽트 수신 시작 (딱 한 번만)
    HAL_UART_Receive_IT(&huart1, &rxData, 1);
 
-   // 4. 허큘러스로 준비 완료 메시지
-   char *ready_msg = "=== Ready ===\r\n";
+   char *ready_msg = "=== Ready (pulse mode) ===\r\n";
    HAL_UART_Transmit(&huart2, (uint8_t*)ready_msg, strlen(ready_msg), 100);
 
-   //---------------------------------------------바퀴-------------------------------------------
    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
-   HAL_TIM_Base_Start(&htim2);
-   uint32_t time = 0;
-   float distance1 = 0.0;
-   float distance2 = 0.0;
-   int wheel1_moment;  // 왼쪽 위
-   int wheel4_moment;  // 오른쪽 위
-   /* USER CODE END 2 */
+   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_4);
+   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3);
+   HAL_TIM_Base_Start(&htim4);
 
-   /* Infinite loop */
-   /* USER CODE BEGIN WHILE */
-   // 0: 전진, 2: 후진, 3: 좌회전 5: 정지
+   float distance1 = 999.0f;
+   float distance2 = 999.0f;
+
    int drive_state = 0;
-   int move_state = 0;
-   int rotate_time = 2500;
+   int move_state  = 0;
+   int rotate_time = 1750;
+   int pwm         = 750;
+
+   uint32_t last_us_tick    = 0;
+   uint32_t last_print_tick = 0;
+
+   /* 팔 초기화: 열림 위치로 한 번 보냈다가 닫아서 기준 위치를 잡는다 */
+   __HAL_TIM_SET_COMPARE(&htim3, ARM_A_CH, ARM_A_OPEN);
+   HAL_Delay(155);
+   __HAL_TIM_SET_COMPARE(&htim3, ARM_B_CH, ARM_B_OPEN);
+   HAL_Delay(1500);
+
+   __HAL_TIM_SET_COMPARE(&htim3, ARM_B_CH, 1100);
+   HAL_Delay(145); // 150
+   __HAL_TIM_SET_COMPARE(&htim3, ARM_A_CH, 2500); // 2600
+
+
+   HAL_Delay(500);
+
+   wheel_stop_all();
+   move        = 5;
+   move_state  = 5;
+   drive_state = 5;
+
    while (1)
    {
+      uint32_t now = HAL_GetTick();
 
-      /* 1. 초음파 센서 거리 측정 */
-      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_5, GPIO_PIN_SET);
-      delay_us(10);
-      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_5, GPIO_PIN_RESET);
-      while(HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_6) == GPIO_PIN_RESET);
-      __HAL_TIM_SET_COUNTER(&htim2, 0);
-      while(HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_6) == GPIO_PIN_SET);
+      /* ============================================================
+       * [1] 최우선: 's' 정지 신호 처리
+       * ============================================================ */
+      if (estop_request)
+      {
+         wheel_stop_all();
+         pulse_active  = 0;
+         pulse_request = 0;
+         tracking_mode = 0;
+         arm_busy      = 0;
+         move          = 5;
+         move_state    = 5;
+         drive_state   = 5;
+         input_state   = 0;
+         estop_request = 0;
 
-      time = __HAL_TIM_GET_COUNTER(&htim2);
-      distance1 = time * 0.034f / 2.0f;
+         arm_close_fast();
 
-      HAL_Delay(50);
+         printf("ESTOP: motors halted\r\n");
+         continue;
+      }
 
-      HAL_GPIO_WritePin(GPIOA, GPIO_PIN_7, GPIO_PIN_SET);
-      delay_us(10);
-      HAL_GPIO_WritePin(GPIOA, GPIO_PIN_7, GPIO_PIN_RESET);
-      while(HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_7) == GPIO_PIN_RESET);
-      __HAL_TIM_SET_COUNTER(&htim2, 0);
-      while(HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_7) == GPIO_PIN_SET);
+      /* ============================================================
+       * [2] 펄스 만료 검사 (논블로킹)
+       * 펄스 시간이 지나면 즉시 정지시킨다. 이게 오버슈트를 막는 핵심.
+       * 루프가 매번 빠르게 돌아야 정확하므로, 아래 초음파/printf는
+       * 전부 주기 게이트를 걸어 두었다.
+       * ============================================================ */
+      if (pulse_active && (int32_t)(now - pulse_end_tick) >= 0)
+      {
+         wheel_stop_all();
+         pulse_active = 0;
+         drive_state  = 5;
+      }
 
-      time = __HAL_TIM_GET_COUNTER(&htim2);
-      distance2 = time * 0.034f / 2.0f;
+      /* ============================================================
+       * [3] 추적 명령 워치독
+       * 라파5가 죽거나 통신이 끊겨서 명령이 안 오면 무조건 정지.
+       * 로봇이 통제 불능으로 계속 달리는 걸 막는 안전장치.
+       * ============================================================ */
+      if (tracking_mode && (now - last_track_tick) > CMD_WATCHDOG_MS)
+      {
+         if (pulse_active || drive_state != 5)
+         {
+            wheel_stop_all();
+            pulse_active = 0;
+            drive_state  = 5;
+            printf("WATCHDOG: no track cmd, stopped\r\n");
+         }
+         tracking_mode = 0;
+      }
 
-      printf("state: %d | distance1: %.1f cm | distance2: %.1f cm \r\n", drive_state,distance1,distance2);
+      /* ============================================================
+       * [4] 문 상태 변화 처리
+       * ============================================================ */
+      if (front_door == 0 && last_front_door_state != front_door)
+      {
+         /* 수동 닫기도 동일하게 양쪽 동시 램프로 천천히 닫는다. */
+         arm_close_sweep();
+      }
+      if (front_door == 1 && last_front_door_state != front_door)
+      {
+         arm_open();
+      }
+      last_front_door_state = front_door;
 
-      //================================================================
-            // ▼▼▼ 여기부터 "움직이는 로직" — 초음파 값(distance1, distance2)은
-            //     위에서 이미 구해진 걸 그대로 사용만 함 ▼▼▼
-            //================================================================
+      /* ============================================================
+       * [5] 'e' EAT 시퀀스: 정지 -> 문 열기 -> 전진 -> 문 닫기
+       * 각 단계마다 estop을 검사해서 's'가 오면 즉시 중단.
+       * ============================================================ */
+      if (eat_request && !arm_busy)
+      {
+         arm_busy      = 1;
+         eat_request   = 0;
+         tracking_mode = 0;      /* eat 중에는 추적 워치독을 끈다 */
+         pulse_active  = 0;
+         pulse_request = 0;
 
-            // ==========================================================
-            // [상황 A] 장애물 감지 → 후진 시작  ***최우선순위, 무조건 실행***
-            // 전진 중(drive_state==0)에 30cm 이내 장애물 감지되면
-            // 쓰레기를 쫓고 있던 중이어도 무조건 정지 후 후진으로 전환.
-            // ==========================================================
-            if ((drive_state == 0 && distance1 <= 30) || (drive_state == 0 && distance2 <= 30)) {
+         wheel_stop_all();
+         delay_ms_check_estop(150);
 
-               // --- 서서히 감속 정지 ---
-               for(int speed = 900; speed >= 0; speed -= 225) {
-                  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, speed);
-                  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, speed);
-                  HAL_Delay(60);
-               }
-               __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
-               __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, 0);
-               HAL_Delay(500);
+         if (!estop_request)
+         {
+            /* 팔 열기 */
+            arm_open();
+            delay_ms_check_estop(OPEN_HOLD_MS);
+         }
 
+         if (!estop_request)
+         {
+            /* 문 열린 채로 스쿱 전진 */
+            wheel_on(1, 1, pwm - 150);
+            delay_ms_check_estop(EAT_TRAVEL_MS);
+         }
 
-               // --- 후진 시작 (폰에서 미리 받은 turn_back_left 값에 따라 방향 다르게) ---
-               if(turn_back_left == 1){
-                  wheel1_moment = 0; wheel4_moment = 1;
-                  HAL_GPIO_WritePin(GPIOC,GPIO_PIN_0,wheel1_moment);
-                  HAL_GPIO_WritePin(GPIOC,GPIO_PIN_1,!wheel1_moment);
-                  HAL_GPIO_WritePin(GPIOA,GPIO_PIN_4,!wheel4_moment);
-                  HAL_GPIO_WritePin(GPIOB,GPIO_PIN_0,!wheel4_moment);
-                  for(int speed = 0; speed <= 1000; speed += 250) {
-                     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, speed);
-                     HAL_Delay(60);
-                  }
-                  turn_back_left = 0;
-               }
-               else if(turn_back_left == 2){
-                  wheel1_moment = 0; wheel4_moment = 1;
-                  HAL_GPIO_WritePin(GPIOC,GPIO_PIN_0,wheel1_moment);
-                  HAL_GPIO_WritePin(GPIOC,GPIO_PIN_1,!wheel1_moment);
-                  HAL_GPIO_WritePin(GPIOA,GPIO_PIN_4,!wheel4_moment);
-                  HAL_GPIO_WritePin(GPIOB,GPIO_PIN_0,!wheel4_moment);
-                  for(int speed = 0; speed <= 1000; speed += 250) {
-                     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, speed);
-                     HAL_Delay(60);
-                  }
-                  turn_back_left = 0;
-               }
-               else{
-                  wheel_on(0, 0, 0, 0, 1000); // 그냥 직진 후진
-               }
+         if (!estop_request)
+         {
+            /* ★ 반드시 완전히 정지한 뒤에 팔을 닫는다.
+             * 움직이면서 닫으면 로봇의 관성 때문에 쓰레기가 상대적으로
+             * 뒤로 밀리면서 팔 밖으로 빠져나간다. */
+            wheel_decel_stop(1);
+            delay_ms_check_estop(250);
 
-               // [중요] 벽 회피가 최우선이므로, 후진 진입 시 YOLO 추적 흔적은 리셋
-               // -> 후진 도중 쓰레기가 다시 보이면 아래 [상황 B]에서 새로 판단하게 함
-               move = 2;
-               move_state = 2;
+            /* 양쪽 팔을 동시에 천천히 오므려 물체를 중앙에 물린다 */
+            arm_close_sweep();
+
+            front_door            = 0;
+            last_front_door_state = 0;
+
+            /* eat 끝나면 정지 상태로 복귀. 다음 추적 명령을 기다린다. */
+            wheel_stop_all();
+            move        = 5;
+            move_state  = 5;
+            drive_state = 5;
+         }
+
+         arm_busy = 0;
+         continue;   /* eat 직후엔 이번 루프의 나머지를 건너뛴다 */
+      }
+
+      /* ============================================================
+       * [6] 추적 펄스 실행
+       * ISR이 세운 pulse_request를 받아 짧게 구동하고 만료 시각만 기록.
+       * 여기서 블로킹 대기를 하지 않는다 -> [2]가 알아서 정지시킴.
+       * ============================================================ */
+      if (pulse_request && !arm_busy)
+      {
+         int req = pulse_request;
+         pulse_request = 0;
+
+         if (!estop_request)
+         {
+            if (req == 1) {          /* 미세 좌회전 */
+               wheel_drive(0, pwm - 50, 1, pwm - 50);
+               pulse_end_tick = HAL_GetTick() + PULSE_TURN_FINE_MS;
+               drive_state = 3;
+            }
+            else if (req == 2) {     /* 미세 우회전 */
+               wheel_drive(1, pwm - 50, 0, pwm - 50);
+               pulse_end_tick = HAL_GetTick() + PULSE_TURN_FINE_MS;
+               drive_state = 4;
+            }
+            else if (req == 5) {     /* 큰 좌회전 */
+               wheel_drive(0, pwm - 50, 1, pwm - 50);
+               pulse_end_tick = HAL_GetTick() + PULSE_TURN_BIG_MS;
+               drive_state = 3;
+            }
+            else if (req == 6) {     /* 큰 우회전 */
+               wheel_drive(1, pwm - 50, 0, pwm - 50);
+               pulse_end_tick = HAL_GetTick() + PULSE_TURN_BIG_MS;
+               drive_state = 4;
+            }
+            else if (req == 3) {     /* 전진 펄스 */
+               wheel_drive(1, pwm, 1, pwm);
+               pulse_end_tick = HAL_GetTick() + PULSE_FWD_MS;
+               drive_state = 0;
+            }
+            else {                   /* 후진 펄스 (물체가 화면 너무 아래일 때) */
+               wheel_drive(0, pwm, 0, pwm);
+               pulse_end_tick = HAL_GetTick() + PULSE_BACK_MS;
                drive_state = 2;
-               input_state = 0;
             }
+            pulse_active = 1;
+            move_state   = -1;   /* 수동 명령 블록과 상태 충돌 방지 */
+         }
+      }
 
-            // ==========================================================
-            // [상황 B] 후진 중(2) 공간 확보(60cm 이상)
-            // 여기서 우선순위 2번 규칙 적용:
-            //   - input_state == 0 (라즈베리파이가 쓰레기 추적 명령을 안 보낸 상태)
-            //     → 자동 탈출 회전 실행 (폰에서 설정한 turn_left 방향)
-            //   - input_state == 1 (후진 중에 라즈베리파이가 'a'/'d'/'f' 등을 보냄
-            //     = 쓰레기 감지됨) → 자동 탈출 회전 생략하고 쓰레기 추적 명령을
-            //     아래 [명령 처리] 블록이 그대로 실행하게 넘김
-            // ==========================================================
-            else if ((drive_state == 2 && distance1 >= 60) && (drive_state == 2 && distance2 >= 60)) {
+      /* ============================================================
+       * [7] 수동/모드 명령 처리 (연속 주행)
+       * 추적 펄스 중에는 건너뛴다.
+       * ★ 기존의 delay_ms_check_estop(YOLO_INFERENCE_MS) 블로킹 대기는
+       *   제거했다. 그 대기 동안 루프가 멈춰서 펄스 정지도, estop 반응도
+       *   전부 늦어졌다. 이제 타이밍은 펄스와 워치독이 담당한다.
+       * ============================================================ */
+      if (!tracking_mode && !pulse_active && move != move_state)
+      {
+         int cmd = move;
 
-               for(int speed = 900; speed >= 0; speed -= 225) {
-                  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, speed);
-                  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, speed);
-                  HAL_Delay(60);
-               }
-               __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
-               __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, 0);
-               HAL_Delay(500);
+         wheel_stop_all();
+         delay_ms_check_estop(CMD_SETTLE_MS);
 
-               if(input_state == 0){
-                  // --- 쓰레기 추적 명령이 없었음 → 폰에서 설정한 방향으로 자동 탈출 회전 ---
-                  if(turn_left == 1){
-                     wheel1_moment = 1; wheel4_moment = 0;
-                     HAL_GPIO_WritePin(GPIOC,GPIO_PIN_0,wheel1_moment);
-                     HAL_GPIO_WritePin(GPIOC,GPIO_PIN_1,!wheel1_moment);
-                     HAL_GPIO_WritePin(GPIOA,GPIO_PIN_4,!wheel4_moment);
-                     HAL_GPIO_WritePin(GPIOB,GPIO_PIN_0,wheel4_moment);
-                     for(int speed = 0; speed <= 1000; speed += 250) {
-                        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, speed);
-                        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, speed);
-                        HAL_Delay(60);
-                     }
-                     HAL_Delay(rotate_time);
-                     for(int speed = 1000; speed >= 0; speed -= 250) {
-                        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, speed);
-                        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, speed);
-                        HAL_Delay(40);
-                     }
-                     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
-                     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, 0);
-                     HAL_Delay(300);
+         if (!estop_request)
+         {
+            if (cmd == 6)      { wheel_on(1, 1, pwm);       drive_state = 0; input_state = 0; }
+            else if (cmd == 5) { wheel_stop_all();          drive_state = 5; input_state = 0; }
+            else if (cmd == 1) { wheel_on(1, 1, pwm);       drive_state = 0; input_state = 1; }
+            else if (cmd == 2) { wheel_on(0, 0, pwm);       drive_state = 2; input_state = 0; }
+            else if (cmd == 3) { wheel_on(0, 1, pwm - 50);  drive_state = 3; input_state = 0; }
+            else if (cmd == 4) { wheel_on(1, 0, pwm - 50);  drive_state = 4; input_state = 0; }
+
+            move_state = cmd;
+         }
+      }
+
+      /* ============================================================
+       * [8] 초음파 측정 (주기 게이트 + 타임아웃)
+       * 펄스 주행 중에는 측정하지 않는다. 측정이 수십 ms를 잡아먹어서
+       * 펄스 정지 타이밍이 밀리기 때문 (= 오버슈트 재발).
+       * ============================================================ */
+      if (!pulse_active && !arm_busy && (now - last_us_tick) >= ULTRASONIC_INTERVAL_MS)
+      {
+         float d1, d2;
+
+         if (us_measure(GPIOC, GPIO_PIN_5, GPIOB, GPIO_PIN_6, &d1) == 0)
+            distance1 = d1;
+         else
+            distance1 = 999.0f;   /* 측정 실패 = 장애물 없음으로 간주(오동작 방지) */
+
+         HAL_Delay(15);   /* 두 센서 간 크로스토크 방지 */
+
+         if (us_measure(GPIOA, GPIO_PIN_7, GPIOB, GPIO_PIN_7, &d2) == 0)
+            distance2 = d2;
+         else
+            distance2 = 999.0f;
+
+         last_us_tick = HAL_GetTick();
+
+         /* ==========================================================
+          * [9] 자율주행 장애물 회피
+          * ★ 추적 모드일 때는 회피 로직을 돌리지 않는다.
+          *   YOLO가 쓰레기를 향해 접근 중인데 초음파가 그 쓰레기를
+          *   장애물로 인식해서 후진/회전시켜버리면 두 제어가 서로 싸운다.
+          * ========================================================== */
+         if (!tracking_mode)
+         {
+            if (drive_state == 0 && (distance1 <= 30 || distance2 <= 30))
+            {
+               wheel_decel_stop(1);
+               delay_ms_check_estop(300);
+
+               if (estop_request) { /* 다음 루프에서 정지로 수렴 */ }
+               else if (turn_back_left == 1)
+               {
+                  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_4, 0);
+                  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, 0);
+                  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, 0);
+
+                  /* ★ pwm을 쓰기 직전 재확인: 바깥 검사와 이 쓰기 사이에
+                   * ISR이 estop을 세팅했다면, ISR이 0으로 만들어놓은
+                   * 레지스터를 여기서 덮어써서 정지가 씹히게 된다. */
+                  if (!estop_request)
+                  {
+                     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pwm);
+                     turn_back_left = 0;
+                     move = 2; move_state = 2; drive_state = 2; input_state = 0;
                   }
-                  else if(turn_left == 2){
-                     wheel1_moment = 0; wheel4_moment = 1;
-                     HAL_GPIO_WritePin(GPIOC,GPIO_PIN_0,wheel1_moment);
-                     HAL_GPIO_WritePin(GPIOC,GPIO_PIN_1,!wheel1_moment);
-                     HAL_GPIO_WritePin(GPIOA,GPIO_PIN_4,!wheel4_moment);
-                     HAL_GPIO_WritePin(GPIOB,GPIO_PIN_0,wheel4_moment);
-                     for(int speed = 0; speed <= 1000; speed += 250) {
-                        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, speed);
-                        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, speed);
-                        HAL_Delay(60);
-                     }
-                     HAL_Delay(rotate_time);
-                     for(int speed = 1000; speed >= 0; speed -= 250) {
-                        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, speed);
-                        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, speed);
-                        HAL_Delay(40);
-                     }
-                     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
-                     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, 0);
-                     HAL_Delay(300);
+               }
+               else if (turn_back_left == 2)
+               {
+                  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
+                  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, 0);
+                  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_4, 0);
+
+                  if (!estop_request)
+                  {
+                     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, pwm);
+                     turn_back_left = 0;
+                     move = 2; move_state = 2; drive_state = 2; input_state = 0;
                   }
-                  wheel_on(1, 1, 1, 1, 900);
-
-                  // [수정] move/move_state도 같이 맞춰줘야 아래 "기본 전진 유지" 블록이
-                  //        정상 동작하고, 다음 move!=move_state 판정에서 중복 실행 안 됨
-                  move = 1;
-                  move_state = 1;
-                  drive_state = 0;
                }
-               else {
-                  // --- input_state==1: 쓰레기 감지되어 라즈베리파이가 이미 명령을 보낸 상태 ---
-                  // 자동 탈출 회전 하지 않고, 그냥 넘어가서
-                  // 아래 [명령 처리] 블록이 라즈베리파이가 보낸 a/d/f 명령을 그대로 실행하게 둠
-                  // (= 쓰레기 쪽으로 이동, 우선순위 2번 규칙)
+               else
+               {
+                  wheel_on(0, 0, pwm);
+                  move = 2; move_state = 2; drive_state = 2; input_state = 0;
                }
             }
+            else if (drive_state == 2 && distance1 >= 60 && distance2 >= 60)
+            {
+               wheel_decel_stop(0);
+               delay_ms_check_estop(300);
 
-            else {
-               HAL_Delay(10);
+               if (!estop_request)
+               {
+                  if (input_state == 0)
+                  {
+                     if (turn_left == 1)
+                     {
+                        __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_4, 0);
+                        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
+                        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, pwm);
+                        __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, pwm);
+                        delay_ms_check_estop(rotate_time);
+                        wheel_stop_all();
+                        delay_ms_check_estop(200);
+                     }
+                     else if (turn_left == 2)
+                     {
+                        __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, 0);
+                        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, 0);
+                        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pwm);
+                        __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_4, pwm);
+                        delay_ms_check_estop(rotate_time);
+                        wheel_stop_all();
+                        delay_ms_check_estop(200);
+                     }
+
+                     if (!estop_request)
+                     {
+                        wheel_on(1, 1, pwm);
+                        move = 1; move_state = 1; drive_state = 0;
+                     }
+                  }
+                  else
+                  {
+                     drive_state = 0;
+                  }
+               }
             }
+         }
+      }
 
-            // ==========================================================
-            // [명령 처리] 라즈베리파이(YOLO 추적)에서 온 move 값이 바뀔 때 1회 실행
-            // - 좌/우회전(move==3,4)은 drive_state도 같이 바꿔서 계속 유지되게 함
-            //   (예전엔 20ms만 돌고 강제로 전진 전환돼서 회전이 사실상 안 먹혔음)
-            // - 명령 실행 직후 INFERENCE_WAIT_MS만큼 대기
-            //   → 라즈베리파이5는 YOLO 추론이 느리므로, 로봇이 움직인 뒤
-            //     다음 프레임을 추론할 시간을 벌어주기 위함
-            // ==========================================================
-            #define INFERENCE_WAIT_MS   200   // 필요시 라즈베리파이 추론속도 보고 조절
+      /* ============================================================
+       * [10] 디버그 출력 (주기 게이트)
+       * printf는 115200bps UART라 한 줄에 수 ms가 걸린다.
+       * 매 루프마다 찍으면 펄스 타이밍이 밀리므로 주기를 건다.
+       * ============================================================ */
+      if ((now - last_print_tick) >= PRINT_INTERVAL_MS)
+      {
+         printf("st:%d trk:%d pulse:%d d1:%.0f d2:%.0f\r\n",
+                drive_state, tracking_mode, pulse_active, distance1, distance2);
+         last_print_tick = now;
+      }
 
-            if(move != move_state){
-               wheel_stop(1); wheel_stop(2); wheel_stop(3); wheel_stop(4);
-               HAL_Delay(500);
-
-               if(move == 1){                       // 전진
-                  wheel_on(1,1,1,1,1000);
-                  drive_state = 0;
-                  input_state = 0;
-               }
-               else if(move == 2){                  // 후진
-                  wheel_on(0,0,0,0,1000);
-                  drive_state = 2;
-                  input_state = 0;
-               }
-               else if(move == 3){                  // 좌회전 - 다음 명령 올 때까지 유지
-                  wheel_on(1,1,1,0,700);
-                  drive_state = 3;
-                  input_state = 0;
-               }
-               else if(move == 4){                  // 우회전 - 다음 명령 올 때까지 유지
-                  wheel_on(0,1,1,1,700);
-                  drive_state = 4;
-                  input_state = 0;
-               }
-               else if(move == 5){                  // 정지
-                  wheel_stop(1); wheel_stop(2); wheel_stop(3); wheel_stop(4);
-                  drive_state = 5;
-                  input_state = 0;
-               }
-
-               move_state = move;
-
-               // [추가] 추론 시간 확보용 대기 - 움직임 명령 실행 후에만 적용
-               HAL_Delay(INFERENCE_WAIT_MS);
-            }
-
-            // ==========================================================
-            // [기본 전진 유지] drive_state==0이고 실제로 전진 명령 상태(move==1)일 때만
-            // 매 루프마다 바퀴 값을 재확인해서 세팅
-            // [수정] "&& move == 1" 조건 추가
-            //   → 예전엔 drive_state==0이면 무조건 실행돼서, 방금 세팅한 좌/우회전
-            //     방향을 바로 다음 줄에서 다시 전진으로 덮어써버렸음
-            //     (쓰레기 봐도 회전 안 하고 그냥 직진하던 버그의 핵심 원인)
-            // ==========================================================
-            if(drive_state == 0 && move == 1){
-               wheel1_moment = 1;
-               wheel4_moment = 1;
-
-               HAL_GPIO_WritePin(GPIOC,GPIO_PIN_0,wheel1_moment);
-               HAL_GPIO_WritePin(GPIOC,GPIO_PIN_1,!wheel1_moment);
-               HAL_GPIO_WritePin(GPIOA,GPIO_PIN_4,!wheel4_moment);
-               HAL_GPIO_WritePin(GPIOB,GPIO_PIN_0,wheel4_moment);
-
-               __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 1000);
-               __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, 1000);
-            }
-
-            //================================================================
-            // ▲▲▲ 움직이는 로직 끝 ▲▲▲
-            //================================================================
-
-      //--------------------------------- 건드리지 마삼 ---------------------------------------
-
-      /* USER CODE END WHILE */
-
-      /* USER CODE BEGIN 3 */
+      if (rx_print_flag)
+      {
+         printf("RX:'%c'\r\n", last_rx_char);
+         rx_print_flag = 0;
+      }
    }
-   /* USER CODE END 3 */
 }
 
-/**
- * @brief System Clock Configuration
- * @retval None
- */
+/* ==================== 이하 CubeMX 생성 코드 ==================== */
+
 void SystemClock_Config(void)
 {
    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-   /** Initializes the RCC Oscillators according to the specified parameters
-    * in the RCC_OscInitTypeDef structure.
-    */
    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
    RCC_OscInitStruct.HSEState = RCC_HSE_BYPASS;
    RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
@@ -511,72 +873,46 @@ void SystemClock_Config(void)
    RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
    RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
    RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;
-   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-   {
-      Error_Handler();
-   }
 
-   /** Initializes the CPU, AHB and APB buses clocks
-    */
-   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-         |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) Error_Handler();
+
+   RCC_ClkInitStruct.ClockType =
+         RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK |
+         RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+
    RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
    RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
-   {
-      Error_Handler();
-   }
+   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK) Error_Handler();
 }
 
-/**
- * @brief TIM1 Initialization Function
- * @param None
- * @retval None
- */
 static void MX_TIM1_Init(void)
 {
-
-   /* USER CODE BEGIN TIM1_Init 0 */
-
-   /* USER CODE END TIM1_Init 0 */
-
    TIM_ClockConfigTypeDef sClockSourceConfig = {0};
    TIM_MasterConfigTypeDef sMasterConfig = {0};
    TIM_OC_InitTypeDef sConfigOC = {0};
    TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
 
-   /* USER CODE BEGIN TIM1_Init 1 */
-
-   /* USER CODE END TIM1_Init 1 */
    htim1.Instance = TIM1;
-   htim1.Init.Prescaler = 71;
+   htim1.Init.Prescaler = 72 - 1;
    htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
    htim1.Init.Period = 999;
    htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
    htim1.Init.RepetitionCounter = 0;
    htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-   if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
-   {
-      Error_Handler();
-   }
+
+   if (HAL_TIM_Base_Init(&htim1) != HAL_OK) Error_Handler();
+
    sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-   if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK)
-   {
-      Error_Handler();
-   }
-   if (HAL_TIM_PWM_Init(&htim1) != HAL_OK)
-   {
-      Error_Handler();
-   }
+   if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK) Error_Handler();
+   if (HAL_TIM_PWM_Init(&htim1) != HAL_OK) Error_Handler();
+
    sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
    sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-   if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
-   {
-      Error_Handler();
-   }
+   if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK) Error_Handler();
+
    sConfigOC.OCMode = TIM_OCMODE_PWM1;
    sConfigOC.Pulse = 0;
    sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
@@ -584,14 +920,10 @@ static void MX_TIM1_Init(void)
    sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
    sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
    sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
-   if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-   {
-      Error_Handler();
-   }
-   if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
-   {
-      Error_Handler();
-   }
+
+   if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK) Error_Handler();
+   if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_4) != HAL_OK) Error_Handler();
+
    sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
    sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
    sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
@@ -599,144 +931,104 @@ static void MX_TIM1_Init(void)
    sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
    sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
    sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
-   if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK)
-   {
-      Error_Handler();
-   }
-   /* USER CODE BEGIN TIM1_Init 2 */
+   if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK) Error_Handler();
 
-   /* USER CODE END TIM1_Init 2 */
    HAL_TIM_MspPostInit(&htim1);
-
 }
 
-/**
- * @brief TIM2 Initialization Function
- * @param None
- * @retval None
- */
 static void MX_TIM2_Init(void)
 {
-
-   /* USER CODE BEGIN TIM2_Init 0 */
-
-   /* USER CODE END TIM2_Init 0 */
-
-   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
-   TIM_MasterConfigTypeDef sMasterConfig = {0};
-
-   /* USER CODE BEGIN TIM2_Init 1 */
-
-   /* USER CODE END TIM2_Init 1 */
-   htim2.Instance = TIM2;
-   htim2.Init.Prescaler = 72-1;
-   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-   htim2.Init.Period = 65535;
-   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-   htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-   if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
-   {
-      Error_Handler();
-   }
-   sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-   if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
-   {
-      Error_Handler();
-   }
-   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-   if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
-   {
-      Error_Handler();
-   }
-   /* USER CODE BEGIN TIM2_Init 2 */
-
-   /* USER CODE END TIM2_Init 2 */
-
-}
-
-/**
- * @brief TIM3 Initialization Function
- * @param None
- * @retval None
- */
-static void MX_TIM3_Init(void)
-{
-
-   /* USER CODE BEGIN TIM3_Init 0 */
-
-   /* USER CODE END TIM3_Init 0 */
-
    TIM_ClockConfigTypeDef sClockSourceConfig = {0};
    TIM_MasterConfigTypeDef sMasterConfig = {0};
    TIM_OC_InitTypeDef sConfigOC = {0};
 
-   /* USER CODE BEGIN TIM3_Init 1 */
+   htim2.Instance = TIM2;
+   htim2.Init.Prescaler = 72 - 1;
+   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+   htim2.Init.Period = 999;
+   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+   htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
 
-   /* USER CODE END TIM3_Init 1 */
-   htim3.Instance = TIM3;
-   htim3.Init.Prescaler = 72-1;
-   htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
-   htim3.Init.Period = 20000-1;
-   htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-   htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-   if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
-   {
-      Error_Handler();
-   }
+   if (HAL_TIM_Base_Init(&htim2) != HAL_OK) Error_Handler();
+
    sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-   if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK)
-   {
-      Error_Handler();
-   }
-   if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
-   {
-      Error_Handler();
-   }
+   if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK) Error_Handler();
+   if (HAL_TIM_PWM_Init(&htim2) != HAL_OK) Error_Handler();
+
    sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
    sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-   if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
-   {
-      Error_Handler();
-   }
+   if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK) Error_Handler();
+
    sConfigOC.OCMode = TIM_OCMODE_PWM1;
    sConfigOC.Pulse = 0;
    sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
    sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-   if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-   {
-      Error_Handler();
-   }
-   if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
-   {
-      Error_Handler();
-   }
-   if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
-   {
-      Error_Handler();
-   }
-   /* USER CODE BEGIN TIM3_Init 2 */
 
-   /* USER CODE END TIM3_Init 2 */
-   HAL_TIM_MspPostInit(&htim3);
+   if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_4) != HAL_OK) Error_Handler();
+   if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_3) != HAL_OK) Error_Handler();
 
+   HAL_TIM_MspPostInit(&htim2);
 }
 
-/**
- * @brief USART1 Initialization Function
- * @param None
- * @retval None
- */
+static void MX_TIM3_Init(void)
+{
+   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+   TIM_MasterConfigTypeDef sMasterConfig = {0};
+   TIM_OC_InitTypeDef sConfigOC = {0};
+
+   htim3.Instance = TIM3;
+   htim3.Init.Prescaler = 72 - 1;
+   htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+   htim3.Init.Period = 20000 - 1;
+   htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+   htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+
+   if (HAL_TIM_Base_Init(&htim3) != HAL_OK) Error_Handler();
+
+   sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+   if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK) Error_Handler();
+   if (HAL_TIM_PWM_Init(&htim3) != HAL_OK) Error_Handler();
+
+   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+   if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK) Error_Handler();
+
+   sConfigOC.OCMode = TIM_OCMODE_PWM1;
+   sConfigOC.Pulse = 0;
+   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+
+   if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK) Error_Handler();
+   if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_2) != HAL_OK) Error_Handler();
+   if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_3) != HAL_OK) Error_Handler();
+
+   HAL_TIM_MspPostInit(&htim3);
+}
+
+static void MX_TIM4_Init(void)
+{
+   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+   TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+   htim4.Instance = TIM4;
+   htim4.Init.Prescaler = 72 - 1;
+   htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
+   htim4.Init.Period = 65535;
+   htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+   htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+
+   if (HAL_TIM_Base_Init(&htim4) != HAL_OK) Error_Handler();
+
+   sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+   if (HAL_TIM_ConfigClockSource(&htim4, &sClockSourceConfig) != HAL_OK) Error_Handler();
+
+   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+   if (HAL_TIMEx_MasterConfigSynchronization(&htim4, &sMasterConfig) != HAL_OK) Error_Handler();
+}
+
 static void MX_USART1_UART_Init(void)
 {
-
-   /* USER CODE BEGIN USART1_Init 0 */
-
-   /* USER CODE END USART1_Init 0 */
-
-   /* USER CODE BEGIN USART1_Init 1 */
-
-   /* USER CODE END USART1_Init 1 */
    huart1.Instance = USART1;
    huart1.Init.BaudRate = 115200;
    huart1.Init.WordLength = UART_WORDLENGTH_8B;
@@ -745,31 +1037,12 @@ static void MX_USART1_UART_Init(void)
    huart1.Init.Mode = UART_MODE_TX_RX;
    huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
    huart1.Init.OverSampling = UART_OVERSAMPLING_16;
-   if (HAL_UART_Init(&huart1) != HAL_OK)
-   {
-      Error_Handler();
-   }
-   /* USER CODE BEGIN USART1_Init 2 */
 
-   /* USER CODE END USART1_Init 2 */
-
+   if (HAL_UART_Init(&huart1) != HAL_OK) Error_Handler();
 }
 
-/**
- * @brief USART2 Initialization Function
- * @param None
- * @retval None
- */
 static void MX_USART2_UART_Init(void)
 {
-
-   /* USER CODE BEGIN USART2_Init 0 */
-
-   /* USER CODE END USART2_Init 0 */
-
-   /* USER CODE BEGIN USART2_Init 1 */
-
-   /* USER CODE END USART2_Init 1 */
    huart2.Instance = USART2;
    huart2.Init.BaudRate = 115200;
    huart2.Init.WordLength = UART_WORDLENGTH_8B;
@@ -778,395 +1051,64 @@ static void MX_USART2_UART_Init(void)
    huart2.Init.Mode = UART_MODE_TX_RX;
    huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
    huart2.Init.OverSampling = UART_OVERSAMPLING_16;
-   if (HAL_UART_Init(&huart2) != HAL_OK)
-   {
-      Error_Handler();
-   }
-   /* USER CODE BEGIN USART2_Init 2 */
 
-   /* USER CODE END USART2_Init 2 */
-
+   if (HAL_UART_Init(&huart2) != HAL_OK) Error_Handler();
 }
 
-/**
- * @brief GPIO Initialization Function
- * @param None
- * @retval None
- */
 static void MX_GPIO_Init(void)
 {
    GPIO_InitTypeDef GPIO_InitStruct = {0};
-   /* USER CODE BEGIN MX_GPIO_Init_1 */
 
-   /* USER CODE END MX_GPIO_Init_1 */
+   __HAL_RCC_AFIO_CLK_ENABLE();
+   __HAL_AFIO_REMAP_TIM2_PARTIAL_2();
+   __HAL_AFIO_REMAP_TIM3_ENABLE();
 
-   /* GPIO Ports Clock Enable */
    __HAL_RCC_GPIOC_CLK_ENABLE();
    __HAL_RCC_GPIOD_CLK_ENABLE();
    __HAL_RCC_GPIOA_CLK_ENABLE();
    __HAL_RCC_GPIOB_CLK_ENABLE();
 
-   /*Configure GPIO pin Output Level */
-   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_3
-         |GPIO_PIN_4|GPIO_PIN_5, GPIO_PIN_RESET);
+   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4 | GPIO_PIN_5, GPIO_PIN_RESET);
+   HAL_GPIO_WritePin(GPIOA, LD2_Pin | GPIO_PIN_7, GPIO_PIN_RESET);
 
-   /*Configure GPIO pin Output Level */
-   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_4|LD2_Pin
-         |GPIO_PIN_7, GPIO_PIN_RESET);
-
-   /*Configure GPIO pin Output Level */
-   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET);
-
-   /*Configure GPIO pin : B1_Pin */
    GPIO_InitStruct.Pin = B1_Pin;
    GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
    GPIO_InitStruct.Pull = GPIO_NOPULL;
    HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
 
-   /*Configure GPIO pins : PC0 PC1 PC2 PC3
-                           PC4 PC5 */
-   GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_3
-         |GPIO_PIN_4|GPIO_PIN_5;
+   GPIO_InitStruct.Pin = GPIO_PIN_4 | GPIO_PIN_5;
    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
    GPIO_InitStruct.Pull = GPIO_NOPULL;
    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
    HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-   /*Configure GPIO pins : PA0 PA1 PA4 LD2_Pin
-                           PA7 */
-   GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_4|LD2_Pin
-         |GPIO_PIN_7;
+   GPIO_InitStruct.Pin = LD2_Pin | GPIO_PIN_7;
    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
    GPIO_InitStruct.Pull = GPIO_NOPULL;
    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-   /*Configure GPIO pin : PB0 */
-   GPIO_InitStruct.Pin = GPIO_PIN_0;
-   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-   GPIO_InitStruct.Pull = GPIO_NOPULL;
-   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-   /*Configure GPIO pins : PB6 PB7 */
-   GPIO_InitStruct.Pin = GPIO_PIN_6|GPIO_PIN_7;
+   GPIO_InitStruct.Pin = GPIO_PIN_6 | GPIO_PIN_7;
    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
    GPIO_InitStruct.Pull = GPIO_NOPULL;
    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-   /* EXTI interrupt init*/
    HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
    HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
-
-   /* USER CODE BEGIN MX_GPIO_Init_2 */
-
-   /* USER CODE END MX_GPIO_Init_2 */
 }
 
-/* USER CODE BEGIN 4 */
-void delay_us(uint16_t us){
+void delay_us(uint16_t us)
+{
    __HAL_TIM_SET_COUNTER(&htim2, 0);
    while (__HAL_TIM_GET_COUNTER(&htim2) < us);
 }
 
-void wheel_on(int LT, int LB, int RB, int RT, int speed) {
-   int wheel1_moment = LT;   int wheel2_moment = LB;
-   int wheel3_moment = RB;   int wheel4_moment = RT;
-
-   HAL_GPIO_WritePin(GPIOC,GPIO_PIN_0,wheel1_moment);
-   HAL_GPIO_WritePin(GPIOC,GPIO_PIN_1,!wheel1_moment);
-   HAL_GPIO_WritePin(GPIOC,GPIO_PIN_2,!wheel2_moment);
-   HAL_GPIO_WritePin(GPIOC,GPIO_PIN_3,wheel2_moment);
-   HAL_GPIO_WritePin(GPIOA,GPIO_PIN_1,wheel3_moment);
-   HAL_GPIO_WritePin(GPIOA,GPIO_PIN_0,!wheel3_moment);
-   HAL_GPIO_WritePin(GPIOA,GPIO_PIN_4,!wheel4_moment);
-   HAL_GPIO_WritePin(GPIOB,GPIO_PIN_0,wheel4_moment);
-
-   if (speed <= 0) {
-      speed = 900;
-   } else {
-      speed = speed;
-   }
-
-   for(int speeds = 0; speeds <= speed; speeds += speed/4) {
-      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, speeds);
-      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, speeds);
-      HAL_Delay(60);
-   }
-
-}
-
-void wheel_stop(int off_wheel){
-   if(off_wheel == 1){
-      int wheel1_moment = 1;
-      HAL_GPIO_WritePin(GPIOC,GPIO_PIN_0,!wheel1_moment);
-      HAL_GPIO_WritePin(GPIOC,GPIO_PIN_1,!wheel1_moment);
-   }
-   else if(off_wheel == 2){
-      int wheel2_moment = 1;
-      HAL_GPIO_WritePin(GPIOC,GPIO_PIN_2,!wheel2_moment);
-      HAL_GPIO_WritePin(GPIOC,GPIO_PIN_3,!wheel2_moment);
-   }
-   else if(off_wheel == 3){
-      int wheel3_moment = 1;
-      HAL_GPIO_WritePin(GPIOA,GPIO_PIN_1,!wheel3_moment);
-      HAL_GPIO_WritePin(GPIOA,GPIO_PIN_0,!wheel3_moment);
-   }
-   else if(off_wheel == 4){
-      int wheel4_moment = 1;
-      HAL_GPIO_WritePin(GPIOA,GPIO_PIN_4,!wheel4_moment);
-      HAL_GPIO_WritePin(GPIOB,GPIO_PIN_0,!wheel4_moment);
-   }
-
-   for(int speeds = 1000; speeds >= 0; speeds -= 200) {
-      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, speeds);
-      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, speeds);
-      HAL_Delay(60);
-   }
-}
-/* USER CODE END 4 */
-
-/**
- * @brief  This function is executed in case of error occurrence.
- * @retval None
- */
 void Error_Handler(void)
 {
-   /* USER CODE BEGIN Error_Handler_Debug */
-   /* User can add his own implementation to report the HAL error return state */
    __disable_irq();
-   while (1)
-   {
-   }
-   /* USER CODE END Error_Handler_Debug */
+   while (1) { }
 }
 
-#ifdef  USE_FULL_ASSERT
-/**
- * @brief  Reports the name of the source file and the source line number
- *         where the assert_param error has occurred.
- * @param  file: pointer to the source file name
- * @param  line: assert_param error line source number
- * @retval None
- */
-void assert_failed(uint8_t *file, uint32_t line)
-{
-   /* USER CODE BEGIN 6 */
-   /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
-   /* USER CODE END 6 */
-}
-#endif /* USE_FULL_ASSERT */
-////================================================================
-//      // ▼▼▼ 여기부터 "움직이는 로직" — 초음파 값(distance1, distance2)은
-//      //     위에서 이미 구해진 걸 그대로 사용만 함 ▼▼▼
-//      //================================================================
-//
-//      // ==========================================================
-//      // [상황 A] 장애물 감지 → 후진 시작  ***최우선순위, 무조건 실행***
-//      // 전진 중(drive_state==0)에 30cm 이내 장애물 감지되면
-//      // 쓰레기를 쫓고 있던 중이어도 무조건 정지 후 후진으로 전환.
-//      // ==========================================================
-//      if ((drive_state == 0 && distance1 <= 30) || (drive_state == 0 && distance2 <= 30)) {
-//
-//         // --- 서서히 감속 정지 ---
-//         for(int speed = 900; speed >= 0; speed -= 225) {
-//            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, speed);
-//            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, speed);
-//            HAL_Delay(60);
-//         }
-//         __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
-//         __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, 0);
-//         HAL_Delay(500);
-//
-//         // --- 후진 시작 (폰에서 미리 받은 turn_back_left 값에 따라 방향 다르게) ---
-//         if(turn_back_left == 1){
-//            wheel1_moment = 0; wheel4_moment = 1;
-//            HAL_GPIO_WritePin(GPIOC,GPIO_PIN_0,wheel1_moment);
-//            HAL_GPIO_WritePin(GPIOC,GPIO_PIN_1,!wheel1_moment);
-//            HAL_GPIO_WritePin(GPIOA,GPIO_PIN_4,!wheel4_moment);
-//            HAL_GPIO_WritePin(GPIOB,GPIO_PIN_0,!wheel4_moment);
-//            for(int speed = 0; speed <= 1000; speed += 250) {
-//               __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, speed);
-//               HAL_Delay(60);
-//            }
-//            turn_back_left = 0;
-//         }
-//         else if(turn_back_left == 2){
-//            wheel1_moment = 0; wheel4_moment = 1;
-//            HAL_GPIO_WritePin(GPIOC,GPIO_PIN_0,wheel1_moment);
-//            HAL_GPIO_WritePin(GPIOC,GPIO_PIN_1,!wheel1_moment);
-//            HAL_GPIO_WritePin(GPIOA,GPIO_PIN_4,!wheel4_moment);
-//            HAL_GPIO_WritePin(GPIOB,GPIO_PIN_0,wheel4_moment);
-//            for(int speed = 0; speed <= 1000; speed += 250) {
-//               __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, speed);
-//               HAL_Delay(60);
-//            }
-//            turn_back_left = 0;
-//         }
-//         else{
-//            wheel_on(0, 0, 0, 0, 1000); // 그냥 직진 후진
-//         }
-//
-//         // [중요] 벽 회피가 최우선이므로, 후진 진입 시 YOLO 추적 흔적은 리셋
-//         // -> 후진 도중 쓰레기가 다시 보이면 아래 [상황 B]에서 새로 판단하게 함
-//         move = 2;
-//         move_state = 2;
-//         drive_state = 2;
-//         input_state = 0;
-//      }
-//
-//      // ==========================================================
-//      // [상황 B] 후진 중(2) 공간 확보(60cm 이상)
-//      // 여기서 우선순위 2번 규칙 적용:
-//      //   - input_state == 0 (라즈베리파이가 쓰레기 추적 명령을 안 보낸 상태)
-//      //     → 자동 탈출 회전 실행 (폰에서 설정한 turn_left 방향)
-//      //   - input_state == 1 (후진 중에 라즈베리파이가 'a'/'d'/'f' 등을 보냄
-//      //     = 쓰레기 감지됨) → 자동 탈출 회전 생략하고 쓰레기 추적 명령을
-//      //     아래 [명령 처리] 블록이 그대로 실행하게 넘김
-//      // ==========================================================
-//      else if ((drive_state == 2 && distance1 >= 60) && (drive_state == 2 && distance2 >= 60)) {
-//
-//         for(int speed = 900; speed >= 0; speed -= 225) {
-//            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, speed);
-//            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, speed);
-//            HAL_Delay(60);
-//         }
-//         __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
-//         __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, 0);
-//         HAL_Delay(500);
-//
-//         if(input_state == 0){
-//            // --- 쓰레기 추적 명령이 없었음 → 폰에서 설정한 방향으로 자동 탈출 회전 ---
-//            if(turn_left == 1){
-//               wheel1_moment = 1; wheel4_moment = 0;
-//               HAL_GPIO_WritePin(GPIOC,GPIO_PIN_0,wheel1_moment);
-//               HAL_GPIO_WritePin(GPIOC,GPIO_PIN_1,!wheel1_moment);
-//               HAL_GPIO_WritePin(GPIOA,GPIO_PIN_4,wheel4_moment);
-//               HAL_GPIO_WritePin(GPIOB,GPIO_PIN_0,!wheel4_moment);
-//               for(int speed = 0; speed <= 1000; speed += 250) {
-//                  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, speed);
-//                  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, speed);
-//                  HAL_Delay(60);
-//               }
-//               HAL_Delay(500);
-//               for(int speed = 1000; speed >= 0; speed -= 250) {
-//                  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, speed);
-//                  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, speed);
-//                  HAL_Delay(40);
-//               }
-//               __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
-//               __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, 0);
-//               HAL_Delay(300);
-//            }
-//            else if(turn_left == 2){
-//               wheel1_moment = 0; wheel4_moment = 1;
-//               HAL_GPIO_WritePin(GPIOC,GPIO_PIN_0,!wheel1_moment);
-//               HAL_GPIO_WritePin(GPIOC,GPIO_PIN_1,wheel1_moment);
-//               HAL_GPIO_WritePin(GPIOA,GPIO_PIN_4,!wheel4_moment);
-//               HAL_GPIO_WritePin(GPIOB,GPIO_PIN_0,wheel4_moment);
-//               for(int speed = 0; speed <= 1000; speed += 250) {
-//                  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, speed);
-//                  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, speed);
-//                  HAL_Delay(60);
-//               }
-//               HAL_Delay(500);
-//               for(int speed = 1000; speed >= 0; speed -= 250) {
-//                  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, speed);
-//                  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, speed);
-//                  HAL_Delay(40);
-//               }
-//               __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
-//               __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, 0);
-//               HAL_Delay(300);
-//            }
-//            wheel_on(1, 1, 1, 1, 900);
-//
-//            // [수정] move/move_state도 같이 맞춰줘야 아래 "기본 전진 유지" 블록이
-//            //        정상 동작하고, 다음 move!=move_state 판정에서 중복 실행 안 됨
-//            move = 1;
-//            move_state = 1;
-//            drive_state = 0;
-//         }
-//         else {
-//            // --- input_state==1: 쓰레기 감지되어 라즈베리파이가 이미 명령을 보낸 상태 ---
-//            // 자동 탈출 회전 하지 않고, 그냥 넘어가서
-//            // 아래 [명령 처리] 블록이 라즈베리파이가 보낸 a/d/f 명령을 그대로 실행하게 둠
-//            // (= 쓰레기 쪽으로 이동, 우선순위 2번 규칙)
-//         }
-//      }
-//
-//      else {
-//         HAL_Delay(10);
-//      }
-//
-//      // ==========================================================
-//      // [명령 처리] 라즈베리파이(YOLO 추적)에서 온 move 값이 바뀔 때 1회 실행
-//      // - 좌/우회전(move==3,4)은 drive_state도 같이 바꿔서 계속 유지되게 함
-//      //   (예전엔 20ms만 돌고 강제로 전진 전환돼서 회전이 사실상 안 먹혔음)
-//      // - 명령 실행 직후 INFERENCE_WAIT_MS만큼 대기
-//      //   → 라즈베리파이5는 YOLO 추론이 느리므로, 로봇이 움직인 뒤
-//      //     다음 프레임을 추론할 시간을 벌어주기 위함
-//      // ==========================================================
-//      #define INFERENCE_WAIT_MS   200   // 필요시 라즈베리파이 추론속도 보고 조절
-//
-//      if(move != move_state){
-//         wheel_stop(1); wheel_stop(2); wheel_stop(3); wheel_stop(4);
-//         HAL_Delay(500);
-//
-//         if(move == 1){                       // 전진
-//            wheel_on(1,1,1,1,1000);
-//            drive_state = 0;
-//            input_state = 0;
-//         }
-//         else if(move == 2){                  // 후진
-//            wheel_on(0,0,0,0,1000);
-//            drive_state = 2;
-//            input_state = 0;
-//         }
-//         else if(move == 3){                  // 좌회전 - 다음 명령 올 때까지 유지
-//            wheel_on(1,1,1,0,700);
-//            drive_state = 3;
-//            input_state = 0;
-//         }
-//         else if(move == 4){                  // 우회전 - 다음 명령 올 때까지 유지
-//            wheel_on(0,1,1,1,700);
-//            drive_state = 4;
-//            input_state = 0;
-//         }
-//         else if(move == 5){                  // 정지
-//            wheel_stop(1); wheel_stop(2); wheel_stop(3); wheel_stop(4);
-//            drive_state = 5;
-//            input_state = 0;
-//         }
-//
-//         move_state = move;
-//
-//         // [추가] 추론 시간 확보용 대기 - 움직임 명령 실행 후에만 적용
-//         HAL_Delay(INFERENCE_WAIT_MS);
-//      }
-//
-//      // ==========================================================
-//      // [기본 전진 유지] drive_state==0이고 실제로 전진 명령 상태(move==1)일 때만
-//      // 매 루프마다 바퀴 값을 재확인해서 세팅
-//      // [수정] "&& move == 1" 조건 추가
-//      //   → 예전엔 drive_state==0이면 무조건 실행돼서, 방금 세팅한 좌/우회전
-//      //     방향을 바로 다음 줄에서 다시 전진으로 덮어써버렸음
-//      //     (쓰레기 봐도 회전 안 하고 그냥 직진하던 버그의 핵심 원인)
-//      // ==========================================================
-//      if(drive_state == 0 && move == 1){
-//         wheel1_moment = 1;
-//         wheel4_moment = 1;
-//
-//         HAL_GPIO_WritePin(GPIOC,GPIO_PIN_0,wheel1_moment);
-//         HAL_GPIO_WritePin(GPIOC,GPIO_PIN_1,!wheel1_moment);
-//         HAL_GPIO_WritePin(GPIOA,GPIO_PIN_4,!wheel4_moment);
-//         HAL_GPIO_WritePin(GPIOB,GPIO_PIN_0,wheel4_moment);
-//
-//         __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 1000);
-//         __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, 1000);
-//      }
-//
-//      //================================================================
-//      // ▲▲▲ 움직이는 로직 끝 ▲▲▲
-//      //================================================================
+#ifdef USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line) { }
+#endif
