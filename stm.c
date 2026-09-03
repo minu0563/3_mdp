@@ -77,7 +77,7 @@ int _write(int file, char *ptr, int len)
  *  중앙 근처에서 떨면     -> PULSE_TURN_FINE_MS 를 줄인다
  * ================================================================ */
 #define PULSE_TURN_BIG_MS     240    /* 큰 회전 (오차가 클 때) */
-#define PULSE_TURN_FINE_MS     90    /* 미세 회전 (거의 정렬됐을 때) */
+#define PULSE_TURN_FINE_MS     60    /* 미세 회전 (거의 정렬됐을 때) */
 #define PULSE_FWD_MS          140    /* 전진 1회 펄스 길이(ms) */
 #define PULSE_BACK_MS         160    /* 후진 1회 펄스 길이(ms)
                                       * 물체가 화면 너무 아래(= 로봇에 너무 근접)로
@@ -501,7 +501,7 @@ int main(void)
    int drive_state = 0;
    int move_state  = 0;
    int rotate_time = 1750;
-   int pwm         = 750;
+   int pwm         = 700;
 
    uint32_t last_us_tick    = 0;
    uint32_t last_print_tick = 0;
