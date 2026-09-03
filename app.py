@@ -1,4 +1,3 @@
-```python
 from flask import Flask, request
 import serial
 import threading
@@ -138,4 +137,3 @@ if __name__ == "__main__":
         port=5000,
         threaded=True
     )
-```
