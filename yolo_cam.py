@@ -1,4 +1,3 @@
-```python
 from ultralytics import YOLO
 import cv2
 import requests
@@ -448,7 +447,7 @@ try:
 
         else:
             reset_tracking()
-            cmd = None
+            cmd = "f"
             state_text = "NO TARGET"
             state_color = (128, 128, 128)
 
@@ -493,4 +492,3 @@ finally:
     watcher.stop()
     cam.stop()
     cv2.destroyAllWindows()
-```
