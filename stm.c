@@ -354,6 +354,13 @@ volatile int eat_request = 0;
 volatile int arm_busy    = 0;
 
 /* ================================================================
+ * ★ 추적 중 근접 장애물(사람 등) 알림용
+ * distance <= 30cm 인 동안 'h'를 한 번만 보내고, 벗어나면 리셋해서
+ * 다음 근접 시 다시 알릴 수 있게 한다 (매 200ms마다 스팸 전송 방지).
+ * ================================================================ */
+volatile int obstacle_alert_sent = 0;
+
+/* ================================================================
  * ★ EAT 시퀀스 타이밍 (반드시 실측)
  *
  * OPEN_HOLD_MS : 문을 연 채로 제자리 정지하는 시간.
@@ -501,7 +508,7 @@ int main(void)
    int drive_state = 0;
    int move_state  = 0;
    int rotate_time = 1750;
-   int pwm         = 700;
+   int pwm         = 650;
 
    uint32_t last_us_tick    = 0;
    uint32_t last_print_tick = 0;
@@ -543,6 +550,7 @@ int main(void)
          drive_state   = 5;
          input_state   = 0;
          estop_request = 0;
+         obstacle_alert_sent = 0;
 
          arm_close_fast();
 
@@ -578,6 +586,7 @@ int main(void)
             printf("WATCHDOG: no track cmd, stopped\r\n");
          }
          tracking_mode = 0;
+         obstacle_alert_sent = 0;
       }
 
       /* ============================================================
@@ -605,6 +614,7 @@ int main(void)
          tracking_mode = 0;      /* eat 중에는 추적 워치독을 끈다 */
          pulse_active  = 0;
          pulse_request = 0;
+         obstacle_alert_sent = 0;
 
          wheel_stop_all();
          delay_ms_check_estop(150);
@@ -637,7 +647,9 @@ int main(void)
             front_door            = 0;
             last_front_door_state = 0;
 
-            /* eat 끝나면 정지 상태로 복귀. 다음 추적 명령을 기다린다. */
+            /* eat 끝나면 정지 상태로 복귀. 다음 추적 명령을 기다린다.
+             * ★ tracking_mode는 이미 0이므로, 이후 장애물을 만나면
+             *   섹션 [9]의 자율주행 회피(후진+회전) 로직이 적용된다. */
             wheel_stop_all();
             move        = 5;
             move_state  = 5;
@@ -746,13 +758,59 @@ int main(void)
          last_us_tick = HAL_GetTick();
 
          /* ==========================================================
-          * [9] 자율주행 장애물 회피
-          * ★ 추적 모드일 때는 회피 로직을 돌리지 않는다.
-          *   YOLO가 쓰레기를 향해 접근 중인데 초음파가 그 쓰레기를
-          *   장애물로 인식해서 후진/회전시켜버리면 두 제어가 서로 싸운다.
+          * [9] 초음파 장애물 대응
+          *
+          * ★ 두 갈래로 나뉜다:
+          *
+          *  (A) tracking_mode == 1 (라파가 F/A/D/... 추적 명령을 계속
+          *      보내는 중, 즉 쓰레기를 향해 접근 중인 상황):
+          *      사람 등이 갑자기 끼어든 경우이므로 "후진만" 한다.
+          *      회전(방향 전환)은 하지 않는다 - 카메라가 타겟을
+          *      완전히 놓치면 안 되기 때문이다. 사람이 비켜나면
+          *      라파가 계속 보내고 있는 F가 [6]에서 그대로 처리되어
+          *      자동으로 전진이 재개된다 (별도 코드 불필요).
+          *
+          *  (B) tracking_mode == 0 (추적 중이 아님 - 순찰/eat 완료 후
+          *      등): 기존 자율주행 회피 로직 그대로. 후진 후 충분히
+          *      멀어지면 제자리 회전으로 방향을 바꿔 다시 전진한다.
           * ========================================================== */
-         if (!tracking_mode)
+         if (tracking_mode)
          {
+            /* ------------------------------------------------------
+             * (A) 추적 중 근접 장애물 -> 후진 전용, 회전 없음
+             * ------------------------------------------------------ */
+            if (distance1 <= 30 || distance2 <= 30)
+            {
+               if (!obstacle_alert_sent)
+               {
+                  /* 라파에게 "근접 장애물 있음"을 알려 F 스트림을
+                   * 잠깐 멈추도록 유도 (경합/지글거림 방지용) */
+                  HAL_UART_Transmit(&huart1, (uint8_t*)"h", 1, 100);
+                  obstacle_alert_sent = 1;
+               }
+
+               /* 짧은 후진 펄스 - 블로킹 없이, 펄스 방식 그대로 유지 */
+               wheel_drive(0, pwm, 0, pwm);
+               pulse_end_tick = HAL_GetTick() + PULSE_BACK_MS;
+               pulse_active   = 1;
+               drive_state    = 2;
+
+               /* ★ 큐에 쌓인 F를 취소 - 안 하면 다음 루프에서
+                *   [6]이 그 F를 실행해 후진을 즉시 덮어써버린다. */
+               pulse_request = 0;
+            }
+            else
+            {
+               /* 장애물이 사라짐 - 다음 근접 시 다시 알릴 수 있게 리셋 */
+               obstacle_alert_sent = 0;
+            }
+         }
+         else
+         {
+            /* ------------------------------------------------------
+             * (B) 기존 자율주행 회피 로직 (후진 + 방향 전환 회전)
+             * 수정 없이 그대로 유지.
+             * ------------------------------------------------------ */
             if (drive_state == 0 && (distance1 <= 30 || distance2 <= 30))
             {
                wheel_decel_stop(1);
